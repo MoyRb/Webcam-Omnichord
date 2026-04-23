@@ -15,8 +15,9 @@ type Quality = (typeof QUALITIES)[number]
 
 const VIDEO_WIDTH = 960
 const VIDEO_HEIGHT = 540
-const REPLAY_COOLDOWN_MS = 450
+const REPLAY_COOLDOWN_MS = 300
 const BASE_OCTAVE = 4
+const INDEX_TIP_LANDMARK = 8
 
 const QUALITY_INTERVALS: Record<Quality, number[]> = {
   maj: [0, 4, 7],
@@ -31,7 +32,7 @@ const QUALITY_INTERVALS: Record<Quality, number[]> = {
 const OMNICHORD_POLY_OPTIONS: Tone.PolySynthOptions<Tone.SynthOptions> = {
   volume: -9,
   options: {
-    oscillator: { type: 'triangle8' },
+    oscillator: { type: 'triangle' },
     envelope: { attack: 0.06, decay: 0.2, sustain: 0.55, release: 1.1 },
   },
 }
@@ -52,6 +53,16 @@ function buildChord(root: Root, quality: Quality, octave = BASE_OCTAVE): string[
   return QUALITY_INTERVALS[quality].map((interval) => Tone.Frequency(rootMidi + interval, 'midi').toNote())
 }
 
+function getIndexTipPoint(handLandmarks: NormalizedLandmark[], width: number, height: number): HandPoint | null {
+  const landmark = handLandmarks[INDEX_TIP_LANDMARK]
+  if (!landmark) return null
+
+  return {
+    x: (1 - landmark.x) * width,
+    y: landmark.y * height,
+  }
+}
+
 export default function App() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -61,12 +72,14 @@ export default function App() {
   const streamRef = useRef<MediaStream | null>(null)
 
   const synthRef = useRef<Tone.PolySynth | null>(null)
-  const chorusRef = useRef<Tone.Chorus | null>(null)
   const filterRef = useRef<Tone.Filter | null>(null)
   const reverbRef = useRef<Tone.Reverb | null>(null)
   const delayRef = useRef<Tone.FeedbackDelay | null>(null)
 
   const [audioStarted, setAudioStarted] = useState(false)
+  const [toneContextState, setToneContextState] = useState<string>(Tone.getContext().state)
+  const [outputVolume, setOutputVolume] = useState<number>(Tone.Destination.volume.value)
+  const [audioError, setAudioError] = useState<string | null>(null)
   const [cameraReady, setCameraReady] = useState(false)
   const [cameraError, setCameraError] = useState<string | null>(null)
   const [reverbWet, setReverbWet] = useState(0.35)
@@ -76,6 +89,8 @@ export default function App() {
   const [leftHand, setLeftHand] = useState<HandPoint | null>(null)
   const [rightHand, setRightHand] = useState<HandPoint | null>(null)
   const [handsDetected, setHandsDetected] = useState(0)
+  const [indexTipX, setIndexTipX] = useState<number | null>(null)
+  const [indexTipY, setIndexTipY] = useState<number | null>(null)
   const [debugMessage, setDebugMessage] = useState('Esperando interacción...')
 
   const lastTriggeredChord = useRef<string>('')
@@ -99,27 +114,52 @@ export default function App() {
   }, [])
 
   const initAudio = useCallback(async () => {
-    if (audioStarted) return
-    await Tone.start()
+    try {
+      setAudioError(null)
+      await Tone.start()
+      await Tone.getContext().resume()
 
-    const filter = new Tone.Filter(1200, 'lowpass')
-    const chorus = new Tone.Chorus(1.8, 2.2, 0.35).start()
-    const delay = new Tone.FeedbackDelay('8n', 0.25)
-    const reverb = new Tone.Reverb({ decay: 3, wet: reverbWet })
-    const synth = new Tone.PolySynth(Tone.Synth, OMNICHORD_POLY_OPTIONS)
+      const contextState = Tone.getContext().state
+      setToneContextState(contextState)
 
-    synth.chain(filter, chorus, delay, reverb, Tone.Destination)
-    delay.wet.value = delayWet
+      if (!synthRef.current) {
+        const filter = new Tone.Filter(1200, 'lowpass')
+        const delay = new Tone.FeedbackDelay('8n', 0.25)
+        const reverb = new Tone.Reverb({ decay: 3, wet: reverbWet })
+        const synth = new Tone.PolySynth(Tone.Synth, OMNICHORD_POLY_OPTIONS)
 
-    synthRef.current = synth
-    chorusRef.current = chorus
-    filterRef.current = filter
-    reverbRef.current = reverb
-    delayRef.current = delay
+        delay.wet.value = delayWet
+        Tone.Destination.volume.value = -8
 
-    setAudioStarted(true)
-    setDebugMessage('Audio inicializado correctamente.')
-  }, [audioStarted, delayWet, reverbWet])
+        synth.chain(filter, delay, reverb, Tone.Destination)
+
+        synthRef.current = synth
+        filterRef.current = filter
+        reverbRef.current = reverb
+        delayRef.current = delay
+      }
+
+      setOutputVolume(Tone.Destination.volume.value)
+      const isRunning = Tone.getContext().state === 'running'
+      setAudioStarted(isRunning)
+
+      if (!isRunning || !synthRef.current) {
+        setAudioError('AudioContext no está corriendo. Revisa permisos/audio del navegador')
+        setDebugMessage('No se pudo iniciar el contexto de audio.')
+        return
+      }
+
+      const testNotes = ['C4', 'E4', 'G4']
+      synthRef.current.triggerAttackRelease(testNotes, 0.5)
+      setDebugMessage(`Test audio OK: ${testNotes.join(', ')}`)
+    } catch (error) {
+      setAudioStarted(false)
+      setToneContextState(Tone.getContext().state)
+      setAudioError('AudioContext no está corriendo. Revisa permisos/audio del navegador')
+      const message = error instanceof Error ? error.message : 'Error al inicializar audio.'
+      setDebugMessage(message)
+    }
+  }, [delayWet, reverbWet])
 
   useEffect(() => {
     if (reverbRef.current) reverbRef.current.wet.value = reverbWet
@@ -203,14 +243,17 @@ export default function App() {
       drawSegmentedCircle(ctx, rightZone, QUALITIES, selectedQuality)
 
       landmarks.forEach((hand) => {
-        const wrist = hand[0]
-        const x = wrist.x * canvas.width
-        const y = wrist.y * canvas.height
+        const tipPoint = getIndexTipPoint(hand, canvas.width, canvas.height)
+        if (!tipPoint) return
 
-        ctx.fillStyle = 'rgba(250, 204, 21, 0.9)'
+        ctx.fillStyle = 'rgba(250, 204, 21, 0.95)'
         ctx.beginPath()
-        ctx.arc(x, y, 10, 0, Math.PI * 2)
+        ctx.arc(tipPoint.x, tipPoint.y, 10, 0, Math.PI * 2)
         ctx.fill()
+
+        ctx.strokeStyle = 'rgba(2, 6, 23, 0.95)'
+        ctx.lineWidth = 2
+        ctx.stroke()
       })
     },
     [drawSegmentedCircle, leftZone, rightZone, selectedQuality, selectedRoot],
@@ -227,45 +270,64 @@ export default function App() {
 
     drawOverlay(landmarks)
 
-    const points = landmarks
-      .map((hand) => ({ x: hand[0].x * VIDEO_WIDTH, y: hand[0].y * VIDEO_HEIGHT }))
-      .sort((a, b) => a.x - b.x)
+    const indexTips = landmarks
+      .map((hand) => getIndexTipPoint(hand, VIDEO_WIDTH, VIDEO_HEIGHT))
+      .filter((point): point is HandPoint => point !== null)
 
-    const left = points[0] ?? null
-    const right = points[1] ?? null
-    setLeftHand(left)
-    setRightHand(right)
+    const sortedTips = [...indexTips].sort((a, b) => a.x - b.x)
+    setLeftHand(sortedTips[0] ?? null)
+    setRightHand(sortedTips[1] ?? null)
 
-    if (left && pointInZone(left, leftZone)) {
-      const rootIndex = pointToSegmentIndex(left, leftZone, ROOTS.length)
-      setSelectedRoot(ROOTS[rootIndex])
+    if (indexTips[0]) {
+      setIndexTipX(indexTips[0].x)
+      setIndexTipY(indexTips[0].y)
+    } else {
+      setIndexTipX(null)
+      setIndexTipY(null)
     }
 
-    if (right && pointInZone(right, rightZone)) {
-      const qualityIndex = pointToSegmentIndex(right, rightZone, QUALITIES.length)
-      setSelectedQuality(QUALITIES[qualityIndex])
-    }
+    let nextRoot: Root | null = null
+    let nextQuality: Quality | null = null
 
-    if (right && pointInZone(right, rightZone) && filterRef.current) {
-      const rightXNorm = clamp01((right.x - (rightZone.x - rightZone.r)) / (rightZone.r * 2))
-      filterRef.current.frequency.value = 250 + rightXNorm * 4200
-    }
-
-    if (audioStarted && selectedRoot && selectedQuality && synthRef.current) {
-      const notes = buildChord(selectedRoot, selectedQuality)
-      const chordToken = `${selectedRoot}${selectedQuality}:${notes.join('-')}`
-
-      const now = performance.now()
-      if (chordToken !== lastTriggeredChord.current || now - lastPlayTime.current > REPLAY_COOLDOWN_MS) {
-        synthRef.current.triggerAttackRelease(notes, '8n')
-        lastTriggeredChord.current = chordToken
-        lastPlayTime.current = now
-        setDebugMessage(`Trigger: ${selectedRoot}${selectedQuality} -> ${notes.join(', ')}`)
+    indexTips.forEach((point) => {
+      if (pointInZone(point, leftZone)) {
+        const rootIndex = pointToSegmentIndex(point, leftZone, ROOTS.length)
+        nextRoot = ROOTS[rootIndex]
       }
-    }
+
+      if (pointInZone(point, rightZone)) {
+        const qualityIndex = pointToSegmentIndex(point, rightZone, QUALITIES.length)
+        nextQuality = QUALITIES[qualityIndex]
+
+        if (filterRef.current) {
+          const rightXNorm = clamp01((point.x - (rightZone.x - rightZone.r)) / (rightZone.r * 2))
+          filterRef.current.frequency.value = 250 + rightXNorm * 4200
+        }
+      }
+    })
+
+    if (nextRoot) setSelectedRoot(nextRoot)
+    if (nextQuality) setSelectedQuality(nextQuality)
 
     animationRef.current = requestAnimationFrame(runDetectionFrame)
-  }, [audioStarted, drawOverlay, leftZone, pointInZone, rightZone, selectedQuality, selectedRoot])
+  }, [drawOverlay, leftZone, pointInZone, rightZone])
+
+  useEffect(() => {
+    const chordId = selectedRoot && selectedQuality ? `${selectedRoot}-${selectedQuality}` : ''
+    if (!chordId || !synthRef.current) return
+    if (!audioStarted || Tone.getContext().state !== 'running') return
+
+    const now = performance.now()
+    if (chordId === lastTriggeredChord.current && now - lastPlayTime.current < REPLAY_COOLDOWN_MS) {
+      return
+    }
+
+    const notes = buildChord(selectedRoot, selectedQuality)
+    synthRef.current.triggerAttackRelease(notes, '8n')
+    lastTriggeredChord.current = chordId
+    lastPlayTime.current = now
+    setDebugMessage(`Trigger: ${selectedRoot}${selectedQuality} -> ${notes.join(', ')}`)
+  }, [audioStarted, selectedQuality, selectedRoot])
 
   const enableCamera = useCallback(async () => {
     if (cameraReady) return
@@ -298,7 +360,6 @@ export default function App() {
       streamRef.current?.getTracks().forEach((track) => track.stop())
       handLandmarkerRef.current?.close()
       synthRef.current?.dispose()
-      chorusRef.current?.dispose()
       filterRef.current?.dispose()
       reverbRef.current?.dispose()
       delayRef.current?.dispose()
@@ -335,6 +396,10 @@ export default function App() {
             <div className="rounded-xl border border-amber-400/50 bg-amber-500/10 p-3 text-sm text-amber-200">
               Primero presiona Start Audio
             </div>
+          ) : null}
+
+          {audioError ? (
+            <div className="rounded-xl border border-rose-400/50 bg-rose-500/10 p-3 text-sm text-rose-200">{audioError}</div>
           ) : null}
 
           {cameraError ? (
@@ -378,10 +443,15 @@ export default function App() {
 
           <div className="rounded-xl border border-cyan-400/40 bg-slate-950/80 p-3 font-mono text-xs text-cyan-100">
             <p>audioStarted: {String(audioStarted)}</p>
+            <p>toneContextState: {toneContextState}</p>
+            <p>outputVolume: {outputVolume.toFixed(1)} dB</p>
             <p>root seleccionada: {selectedRoot ?? '—'}</p>
             <p>quality seleccionada: {selectedQuality ?? '—'}</p>
             <p>chord final: {currentChordLabel}</p>
             <p>manos detectadas: {handsDetected}</p>
+            <p>indexTipX: {indexTipX?.toFixed(1) ?? '—'}</p>
+            <p>indexTipY: {indexTipY?.toFixed(1) ?? '—'}</p>
+            <p>landmarkUsed: {INDEX_TIP_LANDMARK}</p>
             <p className="mt-2 text-cyan-300">{debugMessage}</p>
           </div>
         </aside>

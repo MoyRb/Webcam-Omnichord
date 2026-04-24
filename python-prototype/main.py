@@ -8,6 +8,8 @@ import mediapipe as mp
 import numpy as np
 import sounddevice as sd
 
+MASTER_GAIN = 3.0
+
 
 ROOTS = ["C", "D", "E", "F", "G", "A", "B"]
 QUALITIES = ["Mayor", "Menor", "7", "Maj7", "m7", "sus4", "dim"]
@@ -89,9 +91,10 @@ class AudioEngine:
         self.phase_chorus = np.zeros(self.max_voices, dtype=np.float64)
 
         self.muted = False
+        self.master_gain = MASTER_GAIN
 
         self.stream = sd.OutputStream(
-            channels=1,
+            channels=2,
             callback=self._callback,
             samplerate=self.sample_rate,
             blocksize=self.block_size,
@@ -125,6 +128,9 @@ class AudioEngine:
 
     def toggle_mute(self) -> None:
         self.muted = not self.muted
+
+    def change_master_gain(self, delta: float) -> None:
+        self.master_gain = float(np.clip(self.master_gain + delta, 0.5, 6.0))
 
     def status_text(self) -> str:
         if self.muted:
@@ -179,13 +185,13 @@ class AudioEngine:
                     saw = self._saw(phase)
 
                     # Capa cálida (tri+sine), capa retro (saw leve), sustain órgano.
-                    body = 0.62 * tri + 0.38 * sine
-                    retro = 0.17 * saw
-                    organ = 0.28 * np.sin(2 * math.pi * (phase * 0.5 + 0.15))
+                    body = 0.68 * tri + 0.42 * sine
+                    retro = 0.21 * saw
+                    organ = 0.34 * np.sin(2 * math.pi * (phase * 0.5 + 0.15))
 
                     # Pluck/harp muy sutil por bloque (ataque rápido decreciente).
                     attack_env = np.exp(-t / (0.030 * self.sample_rate))
-                    pluck = 0.12 * np.sin(2 * math.pi * phase * 2.0) * attack_env
+                    pluck = 0.16 * np.sin(2 * math.pi * phase * 2.0) * attack_env
 
                     # Chorus suave por modulación de fase muy lenta.
                     chorus_rate = 0.22 + (voice_idx % 3) * 0.06
@@ -252,11 +258,11 @@ class AudioEngine:
         self.current_amp = self.current_amp * (1.0 - amp_smoothing) + self.target_amp * amp_smoothing
 
         if self.muted:
-            outdata[:] = np.zeros((frames, 1), dtype=np.float32)
+            outdata[:] = np.zeros((frames, 2), dtype=np.float32)
             return
 
         if self.current_freqs.size == 0 and self.current_amp < 1e-4:
-            outdata[:] = np.zeros((frames, 1), dtype=np.float32)
+            outdata[:] = np.zeros((frames, 2), dtype=np.float32)
             return
 
         t = np.arange(frames, dtype=np.float64)
@@ -277,8 +283,21 @@ class AudioEngine:
             self.prev_freqs = np.array([], dtype=np.float64)
 
         effected = self._apply_fx(mixed)
-        out = np.tanh(effected * 1.28) * self.current_amp
+
+        # Seguridad post-mezcla: normalización suave por bloque.
+        peak = float(np.max(np.abs(effected))) if effected.size > 0 else 0.0
+        if peak > 0.80:
+            effected = effected * (0.80 / peak)
+
+        # Ganancia maestra configurable al final de la cadena.
+        out = effected * self.current_amp * self.master_gain
+
+        # Limitador suave anti-clipping.
+        out = np.tanh(out)
+        out = np.clip(out, -0.95, 0.95)
+
         outdata[:, 0] = out.astype(np.float32)
+        outdata[:, 1] = out.astype(np.float32)
 
 
 def quality_suffix(quality: str) -> str:
@@ -563,6 +582,7 @@ def main():
                 f"left ring OFF: {left_off}",
                 f"right ring OFF: {right_off}",
                 f"audio: {engine.status_text()} (M mute)",
+                f"master gain: {engine.master_gain:.2f} (+ / -)",
                 f"fps: {fps:.1f}",
                 "Q para salir",
             ]
@@ -579,6 +599,10 @@ def main():
                 break
             if key in (ord("m"), ord("M")):
                 engine.toggle_mute()
+            if key in (ord("+"), ord("=")):
+                engine.change_master_gain(0.2)
+            if key in (ord("-"), ord("_")):
+                engine.change_master_gain(-0.2)
 
     finally:
         engine.stop()
